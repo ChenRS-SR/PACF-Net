@@ -1,0 +1,21 @@
+# PAC-NET 采集系统依赖
+# 安装命令: pip install -r requirements-collector.txt
+
+# 基础依赖
+numpy>=1.21.0
+pillow>=9.0.0
+opencv-python>=4.5.0
+
+# 数据采集相关
+requests>=2.25.0
+websocket-client>=1.0.0
+scipy>=1.7.0
+
+# UI界面
+tkinter-tooltip
+
+# 可选：IDS相机SDK（如果使用IDS相机）
+# ids_peak  # 需从IDS官网下载安装
+
+# 可选：红外相机（Fotric）
+# 无需额外依赖，使用内置驱动
