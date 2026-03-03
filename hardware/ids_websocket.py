@@ -179,6 +179,127 @@ HOTEND_TEMP_DIRECTION = 1   # 温度方向: 1=增加, -1=减少
 HOTEND_TEMP_STEP = 10       # 温度步长
 
 
+# ==================== OctoPrint 服务管理 ====================
+octoprint_process = None  # OctoPrint服务进程
+octoprint_service_running = False  # 服务是否由本程序启动
+
+import subprocess
+import platform
+
+def is_octoprint_running():
+    """检测OctoPrint服务是否已运行"""
+    try:
+        response = requests.get(f"{OCTOPRINT_URL}/api/version", 
+                               headers={"X-Api-Key": API_KEY}, 
+                               timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+def start_octoprint_service():
+    """启动OctoPrint服务"""
+    global octoprint_process, octoprint_service_running
+    
+    if is_octoprint_running():
+        print("[OctoPrint] 服务已在运行")
+        return True
+    
+    try:
+        print("[OctoPrint] 正在启动服务...")
+        
+        # 检测操作系统
+        system = platform.system()
+        
+        if system == "Windows":
+            # Windows: 使用octoprint serve命令
+            # 尝试检测conda环境并激活
+            conda_env = os.environ.get('CONDA_DEFAULT_ENV', '')
+            
+            if conda_env:
+                print(f"[OctoPrint] 检测到conda环境: {conda_env}")
+                # 使用conda run直接运行
+                octoprint_process = subprocess.Popen(
+                    ["conda", "run", "-n", conda_env, "octoprint", "serve"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+            else:
+                # 直接运行octoprint
+                octoprint_process = subprocess.Popen(
+                    ["octoprint", "serve"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+        else:
+            # Linux/Mac
+            octoprint_process = subprocess.Popen(
+                ["octoprint", "serve"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid
+            )
+        
+        octoprint_service_running = True
+        
+        # 等待服务启动
+        for i in range(30):  # 最多等待30秒
+            time.sleep(1)
+            if is_octoprint_running():
+                print("[OctoPrint] 服务启动成功")
+                return True
+            if i % 5 == 0:
+                print(f"[OctoPrint] 等待服务启动... ({i}s)")
+        
+        print("[OctoPrint] 服务启动超时，请检查配置")
+        return False
+        
+    except Exception as e:
+        print(f"[OctoPrint] 启动失败: {e}")
+        print("[提示] 请确保已安装OctoPrint: pip install octoprint")
+        return False
+
+def stop_octoprint_service():
+    """停止OctoPrint服务"""
+    global octoprint_process, octoprint_service_running
+    
+    if not octoprint_service_running or octoprint_process is None:
+        return
+    
+    try:
+        print("[OctoPrint] 正在停止服务...")
+        
+        system = platform.system()
+        
+        if system == "Windows":
+            # Windows: 发送CTRL+C然后终止
+            octoprint_process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            # Linux/Mac: 发送SIGTERM
+            os.killpg(os.getpgid(octoprint_process.pid), signal.SIGTERM)
+        
+        # 等待进程结束
+        octoprint_process.wait(timeout=5)
+        print("[OctoPrint] 服务已停止")
+        
+    except Exception as e:
+        print(f"[OctoPrint] 停止服务时出错: {e}")
+        # 强制终止
+        try:
+            octoprint_process.kill()
+        except:
+            pass
+    finally:
+        octoprint_process = None
+        octoprint_service_running = False
+
+# 导入signal模块（用于停止服务）
+import signal
+
+# ==================== OctoPrint 服务管理结束 ====================
+
+
 #其他全局变量
 IMAGE_COUNT = 0
 INIT_MODEL = False
@@ -2786,6 +2907,42 @@ status_frame.pack(fill='x', pady=5)
 close_loop_label = tk.Label(status_frame, text="闭环调控情况:", bg='#f0f0f0', font=label_font)
 close_loop_label.pack(anchor='w', padx=5, pady=5)
 
+#---OctoPrint 服务控制
+octoprint_frame = tk.LabelFrame(right_panel, text="OctoPrint 服务", bg='#f0f0f0', font=title_font)
+octoprint_frame.pack(fill='x', pady=5)
+
+octoprint_status_label = tk.Label(octoprint_frame, text="状态: 检测中...", bg='#f0f0f0', font=label_font, fg='#666666')
+octoprint_status_label.pack(anchor='w', padx=5, pady=3)
+
+octoprint_btn_frame = tk.Frame(octoprint_frame, bg='#f0f0f0')
+octoprint_btn_frame.pack(fill='x', padx=5, pady=3)
+
+def toggle_octoprint_service():
+    """启动/停止OctoPrint服务"""
+    if is_octoprint_running():
+        # 停止服务
+        stop_octoprint_service()
+        update_octoprint_ui()
+    else:
+        # 启动服务
+        threading.Thread(target=lambda: [
+            start_octoprint_service(),
+            update_octoprint_ui()
+        ], daemon=True).start()
+
+def update_octoprint_ui():
+    """更新OctoPrint状态UI"""
+    if is_octoprint_running():
+        octoprint_status_label.config(text="状态: 运行中", fg='#4CAF50')
+        octoprint_toggle_btn.config(text="停止服务", bg='#f44336')
+    else:
+        octoprint_status_label.config(text="状态: 未运行", fg='#666666')
+        octoprint_toggle_btn.config(text="启动服务", bg='#4CAF50')
+
+octoprint_toggle_btn = tk.Button(octoprint_btn_frame, text="启动服务", command=toggle_octoprint_service,
+                                 font=button_font, bg='#4CAF50', fg='white', width=12)
+octoprint_toggle_btn.pack(side='left', padx=3)
+
 #---打印机状态显示（替换原来的坐标显示）
 printer_status_frame = tk.LabelFrame(right_panel, text="打印机状态", bg='#f0f0f0', font=title_font)
 printer_status_frame.pack(fill='x', pady=5)
@@ -2915,9 +3072,12 @@ if __name__ == "__main__":
             try:
                 if 'ids_alternative_camera' in globals() and ids_alternative_camera is not None:
                     ids_alternative_camera.release()
-                    print("✓ IDS替代摄像头已关闭")
+                    print("✓ 随轴替代摄像头已关闭")
             except Exception as e:
-                print(f"关闭IDS替代摄像头失败: {e}")
+                print(f"关闭替代摄像头失败: {e}")
+        
+        # 停止OctoPrint服务（如果是本程序启动的）
+        stop_octoprint_service()
         
         print("[系统] 资源清理完毕，应用退出")
         
@@ -2939,6 +3099,44 @@ if __name__ == "__main__":
         """定时更新打印机状态显示"""
         update_printer_status_display()
         root.after(2000, schedule_printer_status_update)
+    
+    # ========== OctoPrint 服务自动检测与启动 ==========
+    def auto_start_octoprint():
+        """自动检测并启动OctoPrint服务"""
+        print("\n[OctoPrint] 检测服务状态...")
+        
+        if is_octoprint_running():
+            print("[OctoPrint] 服务已在运行")
+            update_octoprint_ui()
+        else:
+            print("[OctoPrint] 服务未运行，尝试自动启动...")
+            print("[提示] 如需手动启动，请使用左侧'OctoPrint 服务'面板的按钮")
+            
+            # 在新线程中启动，避免阻塞UI
+            def start_and_update():
+                success = start_octoprint_service()
+                if success:
+                    print("[OctoPrint] 自动启动成功")
+                else:
+                    print("[OctoPrint] 自动启动失败，请检查:")
+                    print("  1. 是否已安装OctoPrint: pip install octoprint")
+                    print("  2. 是否在正确的conda/virtual环境中")
+                    print("  3. 或手动启动: octoprint serve")
+                # 在主线程中更新UI
+                root.after(0, update_octoprint_ui)
+            
+            threading.Thread(target=start_and_update, daemon=True).start()
+    
+    # 程序启动后3秒自动检测/启动OctoPrint（给UI一点时间加载）
+    root.after(3000, auto_start_octoprint)
+    
+    # 定时更新OctoPrint状态（每5秒）
+    def schedule_octoprint_status_update():
+        update_octoprint_ui()
+        root.after(5000, schedule_octoprint_status_update)
+    
+    root.after(5000, schedule_octoprint_status_update)
+    # =============================================
     
     # 启动定时器
     root.after(500, schedule_m114_update)

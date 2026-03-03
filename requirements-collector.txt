@@ -19,3 +19,8 @@ tkinter-tooltip
 
 # 可选：红外相机（Fotric）
 # 无需额外依赖，使用内置驱动
+
+# OctoPrint 服务（用于打印机通信）
+# 安装命令: pip install octoprint
+# 或: pip install 'octoprint>=1.9.0'
+octoprint>=1.9.0; python_version >= "3.8"
