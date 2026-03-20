@@ -19,11 +19,12 @@ import numpy as np
 from collections import deque,Counter
 from ids_peak import ids_peak
 from ids_peak import ids_peak_ipl_extension
-from predict import predict_single, load_model
-from configs.config import config
+from configs.config import config, OCTOPRINT, THERMAL_VISUALIZATION
+from configs.collector_config import OCTOPRINT_CONFIG, CAMERA_CONFIG
 import struct
 from hardware.fotric_driver import FotricEnhancedDevice
 import websocket
+from websocket import WebSocketApp
 import json
 
 # M114 Coordinator for real-time position tracking
@@ -92,9 +93,9 @@ hex    dec      describe
 """
 # endregion
 
-# OctoPrint 配置
-OCTOPRINT_URL = "http://127.0.0.1:5000"
-API_KEY = "UGjrS2T5n_48GF0YsWADx1EoTILjwn7ZkeWUfgGvW2Q"
+# OctoPrint 配置（从 collector_config 导入）
+OCTOPRINT_URL = OCTOPRINT_CONFIG['url']
+API_KEY = OCTOPRINT_CONFIG['api_key']
 
 # ==================== 相机配置区域（用户可修改） ====================
 
@@ -103,8 +104,8 @@ CAMERA_CONFIG = {
     # 随轴相机（IDS 或替代摄像头）
     "ids": {
         "enabled": True,           # 是否启用IDS/随轴相机
-        "alternative_device_ids": [0, 3, 4],  # IDS不可用时尝试的替代设备编号列表
-        "skip_devices": [1],       # 要跳过的设备编号（如旁轴相机使用的设备）
+        "alternative_device_ids": [1, 4],  # IDS不可用时尝试的替代设备编号列表
+        "skip_devices": [0],       # 要跳过的设备编号（如旁轴相机使用的设备）
         "resolution": (1920, 1080), # 目标分辨率 (宽, 高)
         "fallback_resolutions": [  # 如果目标分辨率不可用，尝试这些
             (1920, 1080),
@@ -118,7 +119,7 @@ CAMERA_CONFIG = {
     # 旁轴可见光相机（电脑摄像头）
     "computer": {
         "enabled": True,
-        "device_id": 1,            # 设备编号
+        "device_id": 0,            # 设备编号
         "resolution": (1920, 1080),
         "fps": 30,
         "buffer_size": 1,          # 缓冲区大小
@@ -444,15 +445,23 @@ def is_printer_actually_printing():
         return False
 
 #发送G代码
-def send_gcode(command):
+def send_gcode(command, timeout=3):
+    """发送G代码到打印机，带超时保护"""
     url = f"{OCTOPRINT_URL}/api/printer/command"
     headers = {"X-Api-Key":API_KEY}
     data = {"command":command}
-    response = requests.post(url,headers=headers,json=data)
-    if response.status_code == 204:
-        return True
-    else:
-        print(f"Error:{response.status_code}")
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=timeout)
+        if response.status_code == 204:
+            return True
+        else:
+            print(f"[G代码发送错误] {command} -> HTTP {response.status_code}")
+            return False
+    except requests.exceptions.Timeout:
+        print(f"[G代码发送超时] {command}")
+        return False
+    except Exception as e:
+        print(f"[G代码发送异常] {command} -> {e}")
         return False
 
 # 异步发送G代码（不阻塞主线程）
@@ -465,6 +474,45 @@ def send_gcode_async(command):
             print(f"[异步G代码] 发送失败: {command} - {e}")
     
     thread = threading.Thread(target=_send, daemon=True)
+    thread.start()
+
+def send_gcode_batch(commands, delay=0.3):
+    """
+    批量发送G代码命令，使用M114锁避免冲突
+    
+    Args:
+        commands: G代码命令列表
+        delay: 命令间隔延迟（秒）
+    """
+    global m114_last_update_time
+    
+    def _send_batch():
+        # 获取M114锁，暂停M114更新
+        if m114_update_lock.acquire(blocking=True, timeout=3):
+            try:
+                # 标记最近更新时间，暂停M114 8秒
+                m114_last_update_time = time.time() + 5
+                
+                print(f"[批量发送] 开始发送 {len(commands)} 个命令，M114暂停8秒")
+                
+                for i, cmd in enumerate(commands):
+                    success = send_gcode(cmd, timeout=5)
+                    if not success:
+                        print(f"[批量发送警告] 命令可能失败: {cmd}")
+                    # 最后一个命令后不需要延迟
+                    if i < len(commands) - 1:
+                        time.sleep(delay)
+                
+                # 更新最后M114时间，再暂停3秒
+                m114_last_update_time = time.time() + 3
+                print(f"[批量发送] 所有命令已发送")
+                
+            finally:
+                m114_update_lock.release()
+        else:
+            print(f"[批量发送警告] 无法获取M114锁，命令可能与其他操作冲突")
+    
+    thread = threading.Thread(target=_send_batch, daemon=True)
     thread.start()
 
 # 生成下一个温度值（循环：200->210->...->250->240->...->150->160->...）
@@ -519,6 +567,65 @@ def get_computer_camera_frame():
         print(f"获取旁轴相机图像失败: {e}")
         return None
 
+# 铁红调色板查找表 (LUT) - 256级
+# 颜色渐变：黑(0,0,0) -> 深蓝 -> 紫 -> 红 -> 橙 -> 黄 -> 白(255,255,255)
+_IRON_LUT = None
+
+def get_iron_colormap_lut():
+    """获取铁红调色板查找表（延迟初始化）"""
+    global _IRON_LUT
+    if _IRON_LUT is not None:
+        return _IRON_LUT
+    
+    # 创建铁红调色板 - 256级
+    lut = np.zeros((256, 3), dtype=np.uint8)
+    
+    for i in range(256):
+        t = i / 255.0  # 归一化到 [0, 1]
+        
+        # 铁红调色板的颜色映射
+        # 基于典型的热成像铁红调色板
+        if t < 0.125:  # 0-31: 黑色到深蓝
+            r = 0
+            g = 0
+            b = int(t / 0.125 * 128) + 16
+        elif t < 0.375:  # 32-95: 深蓝到紫色
+            r = int((t - 0.125) / 0.25 * 128)
+            g = 0
+            b = 255
+        elif t < 0.625:  # 96-159: 紫色到红色
+            r = 128 + int((t - 0.375) / 0.25 * 127)
+            g = 0
+            b = 255 - int((t - 0.375) / 0.25 * 128)
+        elif t < 0.875:  # 160-223: 红色到黄色
+            r = 255
+            g = int((t - 0.625) / 0.25 * 255)
+            b = 0
+        else:  # 224-255: 黄色到白色
+            r = 255
+            g = 255
+            b = int((t - 0.875) / 0.125 * 255)
+        
+        lut[i] = [b, g, r]  # OpenCV 使用 BGR 格式
+    
+    _IRON_LUT = lut
+    return _IRON_LUT
+
+def apply_iron_colormap(gray_image):
+    """
+    应用铁红调色板到灰度图像
+    
+    Args:
+        gray_image: 灰度图像 (0-255)
+    
+    Returns:
+        BGR彩色图像
+    """
+    lut = get_iron_colormap_lut()
+    # 使用查找表映射
+    colored = lut[gray_image]
+    return colored
+
 def get_fotric_camera_frame():
     """获取Fotric红外相机的热像数据并转换为可视化图像"""
     global fotric_device, fotric_latest_frame, fotric_temp_min, fotric_temp_max, fotric_temp_avg
@@ -539,14 +646,34 @@ def get_fotric_camera_frame():
             fotric_temp_avg = float(np.mean(thermal_data))
             fotric_latest_frame = thermal_data.copy()
         
-        # 归一化热像数据以便显示
-        if fotric_temp_max > fotric_temp_min:
-            normalized = ((thermal_data - fotric_temp_min) / (fotric_temp_max - fotric_temp_min) * 255).astype(np.uint8)
-        else:
-            normalized = np.zeros_like(thermal_data, dtype=np.uint8)
+        # 归一化热像数据以便显示（使用界面设置的温度范围和调色板）
+        # 尝试从界面控件读取设置，如果失败则使用默认值
+        try:
+            temp_low = float(fotric_temp_min_entry.get())
+            temp_high = float(fotric_temp_max_entry.get())
+            colormap_type = fotric_colormap_var.get()
+        except (NameError, ValueError):
+            # 界面控件未初始化或值无效，使用默认值
+            temp_low = 26.0
+            temp_high = 50.0
+            colormap_type = 'IRON'
         
-        # 应用热力图颜色
-        colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+        # 将温度裁剪到显示范围并归一化到 [0, 255]
+        clipped_temp = np.clip(thermal_data, temp_low, temp_high)
+        normalized = ((clipped_temp - temp_low) / (temp_high - temp_low) * 255).astype(np.uint8)
+        
+        # 应用调色板
+        if colormap_type == 'IRON':
+            # 自定义铁红调色板（黑->深蓝->紫->红->橙->黄->白）
+            colored = apply_iron_colormap(normalized)
+        elif colormap_type == 'JET':
+            colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+        elif colormap_type == 'HOT':
+            colored = cv2.applyColorMap(normalized, cv2.COLORMAP_HOT)
+        elif colormap_type == 'INFERNO':
+            colored = cv2.applyColorMap(normalized, cv2.COLORMAP_INFERNO)
+        else:
+            colored = apply_iron_colormap(normalized)
         
         # 确保图像尺寸一致
         if colored.shape[0] != 360 or colored.shape[1] != 960:
@@ -599,54 +726,44 @@ def update_temperature_display():
 last_coord_timestamp = 0.0  # 上次坐标获取的时间戳
 last_coord_time_diff = 0.0  # 上次图像与坐标的时间差(ms)
 
-def update_m114_coordinates():
+# M114更新锁，避免与参数修改冲突
+m114_update_lock = threading.Lock()
+m114_last_update_time = 0
+m114_skip_counter = 0  # 跳过计数器，用于降低M114频率
+
+def update_z_height_from_displayz():
     """
-    定期获取M114坐标
-    每0.5秒执行一次，与图像采集频率同步
-    记录坐标获取时间戳，用于事后时间匹配
-    
-    优化：在打印机忙（调平、预热等）时跳过查询，避免超时
+    从DisplayZ插件获取当前Z高度
+    通过OctoPrint REST API查询插件提供的Z高度
+    每5秒查询一次，不影响打印性能
     """
-    global current_x, current_y, current_z, last_coord_timestamp
+    global current_z, last_coord_timestamp, m114_last_update_time
     
-    # 检查打印机是否准备好接收M114命令
-    if not is_printer_ready_for_m114():
-        # 打印机忙，跳过本次查询
+    # 限制查询频率：至少间隔5秒
+    current_time = time.time()
+    if current_time - m114_last_update_time < 5.0:
         return
     
     try:
-        coords = m114_coord.wait_for_m114_response(timeout=0.8)  # 缩短超时时间
-        if coords:
-            old_x, old_y, old_z = current_x, current_y, current_z
-            current_x = coords['X']
-            current_y = coords['Y']
-            current_z = coords['Z']
+        # 使用DisplayZ插件的API获取Z高度
+        url = f"{OCTOPRINT_URL}/plugin/DisplayZ/z"
+        headers = {"X-Api-Key": API_KEY}
+        response = requests.get(url, headers=headers, timeout=2)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'z' in data:
+                new_z = float(data['z'])
+                if abs(new_z - current_z) > 0.01:  # Z高度变化超过0.01mm
+                    current_z = new_z
+                    last_coord_timestamp = current_time
+                    print(f"[DisplayZ] Z高度更新: {current_z:.2f}mm")
+        
+        m114_last_update_time = current_time
             
-            # 记录坐标获取时间戳（关键）
-            last_coord_timestamp = time.time()
-            
-            # 只在坐标改变时打印（减少日志噪音）
-            if (abs(old_x - current_x) > 0.01 or 
-                abs(old_y - current_y) > 0.01 or 
-                abs(old_z - current_z) > 0.01):
-                print("[M114] 坐标已更新: X={:.2f}, Y={:.2f}, Z={:.2f} (t={:.3f})".format(
-                    current_x, current_y, current_z, last_coord_timestamp
-                ))
-            
-            # 更新界面显示
-            try:
-                if coordinates_label.winfo_exists():
-                    coordinates_label.config(
-                        text="X: {:.2f}  Y: {:.2f}  Z: {:.2f}".format(current_x, current_y, current_z)
-                    )
-            except:
-                pass
-        else:
-            # 超时但不打印警告（避免日志刷屏）
-            pass
     except Exception as e:
-        # 静默处理错误，不影响UI
-        pass
+        # 静默处理错误，避免干扰正常打印
+        m114_last_update_time = current_time
 
 def update_printer_status_display():
     """
@@ -848,11 +965,18 @@ def on_message(ws_app, message):
                             current_y = payload["position"].get("y", 0.0)
                             current_z = payload["position"].get("z", 0.0)
                             
+                            # 记录坐标获取时间戳
+                            global last_coord_timestamp
+                            last_coord_timestamp = time.time()
+                            
                             # 更新界面显示
-                            if coordinates_label.winfo_exists():
-                                coordinates_label.config(
-                                    text=f"X: {current_x:.2f}  Y: {current_y:.2f}  Z: {current_z:.2f}"
-                                )
+                            try:
+                                if coordinates_label.winfo_exists():
+                                    coordinates_label.config(
+                                        text=f"X: {current_x:.2f}  Y: {current_y:.2f}  Z: {current_z:.2f}"
+                                    )
+                            except:
+                                pass
                     
                     # 消息类型：日志/命令响应（处理M114响应）
                     # M114 的响应格式：X:106.14 Y:117.45 Z:1.60 E:207.39 Count X:8491 Y:9396 Z:635
@@ -943,6 +1067,9 @@ def on_error(ws_app, error):
     is_websocket_connected = False
     error_type = type(error).__name__
     print(f"[WebSocket错误] {error_type}: {error}")
+    # 打印详细错误信息
+    import traceback
+    traceback.print_exc()
 
 def on_close(ws_app, close_status_code, close_msg):
     global is_websocket_connected
@@ -1029,8 +1156,11 @@ def on_open(ws_app):
                     break
                 time.sleep(1)
     
-    thread = threading.Thread(target=get_coordinates_via_m114, daemon=True)
-    thread.start()
+    # 【已禁用】不再启动定时M114发送线程，避免干扰打印机通信
+    # 坐标通过WebSocket被动接收，不再主动发送M114
+    # thread = threading.Thread(target=get_coordinates_via_m114, daemon=True)
+    # thread.start()
+    print("[WebSocket] 主动M114发送已禁用，坐标通过WebSocket被动接收")
 
 # ------------------- WebSocket连接管理 -------------------
 def start_websocket():
@@ -1050,7 +1180,7 @@ def start_websocket():
                     print(f"[WebSocket] 正在连接到 {WS_URL}...")
                     
                     # 创建新的 WebSocket 对象
-                    ws = websocket.WebSocketApp(
+                    ws = WebSocketApp(
                         WS_URL,
                         header={"X-Api-Key": API_KEY},
                         on_message=on_message,
@@ -1066,7 +1196,9 @@ def start_websocket():
                     backoff_delay = 2
                 except Exception as e:
                     retry_count += 1
-                    print(f"[WebSocket] 连接异常（第{retry_count}/{max_retries}次）: {type(e).__name__}")
+                    print(f"[WebSocket] 连接异常（第{retry_count}/{max_retries}次）: {type(e).__name__}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     if retry_count < max_retries:
                         wait_time = min(backoff_delay * retry_count, 30)  # 最多等待30秒
                         print(f"[WebSocket] 等待 {wait_time:.1f} 秒后重试...")
@@ -1239,53 +1371,50 @@ def capture_images(capture_interval, image_queue):
                                 print(f"[标准化采集] Z高度 {current_z_pos:.2f}mm，进入区间 {desc}")
                                 print(f"[标准化采集] 速度: {speed}%, 流量: {flow}%")
                                 
-                                # 发送参数修改（使用异步避免阻塞）
-                                send_gcode_async(f"M220 S{speed}")
-                                send_gcode_async(f"M221 S{flow}")
+                                # 发送参数修改（使用批量发送避免冲突）
+                                send_gcode_batch([f"M220 S{speed}", f"M221 S{flow}"], delay=0.15)
                                 height_updated = True
                             break
                 # =========================================
                 
-                # 普通采集的参数修改逻辑（保持原有逻辑）
+                # 普通采集的参数修改逻辑
                 elif ACQUISITION_MODE == "普通采集" and PRINT_STATE:
                     time_to_change = 120  # 120秒(2分钟)自动改变一次参数
                     count = int(time_to_change/2)
-                    i = 0
                     if(IMAGE_COUNT % count == 0):  # 120秒修改一次打印数据
                         
                         if(PARAM_LOOP):
-                            # 循环参数
-                            FLOW_RATE = PARAM_LOOP_LIST[i][2]
-                            FEED_RATE = PARAM_LOOP_LIST[i][3]
-                            Z_OFF = PARAM_LOOP_LIST[i][1]-PRIMARY_Z_OFF
-                            TARGET_HOTEND = PARAM_LOOP_LIST[i][0]
-                            i += 1
-                            if(i > 9):
-                                i = 0
+                            # 使用循环参数列表
+                            global param_loop_index
+                            if 'param_loop_index' not in globals():
+                                param_loop_index = 0
+                            FLOW_RATE = PARAM_LOOP_LIST[param_loop_index][2]
+                            FEED_RATE = PARAM_LOOP_LIST[param_loop_index][3]
+                            Z_OFF = PARAM_LOOP_LIST[param_loop_index][1]-PRIMARY_Z_OFF
+                            TARGET_HOTEND = PARAM_LOOP_LIST[param_loop_index][0]
+                            param_loop_index += 1
+                            if(param_loop_index > 9):
+                                param_loop_index = 0
+                            print(f"[普通采集-循环模式] 使用PARAM_LOOP_LIST参数: 流量={FLOW_RATE}, 速度={FEED_RATE}")
                         else:
-                            # 随机生成较大误差参数
-                            pass
-                        
-                        # 随机获取打印数据
-                        rate_options = [20, 30, 40, 50, 60, 70, 80, 90, 100, 
-                        110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
-        
-                        # z_off_options 包含了指定的浮点数
-                        z_off_options = [-0.08, -0.04, 0, 0.04, 0.08, 0.12, 0.16, 0.24, 0.32]
-
-                        # 使用 np.random.choice 从列表中随机抽取
-                        FLOW_RATE = np.random.choice(rate_options)
-                        FEED_RATE = np.random.choice(rate_options)
-                        Z_OFF = np.random.choice(z_off_options)
+                            # 随机生成参数（仅在非循环模式下）
+                            rate_options = [20, 30, 40, 50, 60, 70, 80, 90, 100, 
+                            110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
+                            z_off_options = [-0.08, -0.04, 0, 0.04, 0.08, 0.12, 0.16, 0.24, 0.32]
+                            
+                            FLOW_RATE = np.random.choice(rate_options)
+                            FEED_RATE = np.random.choice(rate_options)
+                            Z_OFF = np.random.choice(z_off_options)
+                            print(f"[普通采集-随机模式] 随机参数: 流量={FLOW_RATE}, 速度={FEED_RATE}")
                         
                         change_param_auto(FLOW_RATE, FEED_RATE, Z_OFF, TARGET_HOTEND)  # 自动修改参数
                 #获取图像
-                print(f"[第{IMAGE_COUNT}帧] 开始获取IDS相机图像...")
+                #print(f"[第{IMAGE_COUNT}帧] 开始获取IDS相机图像...")
                 # IDS相机图像（已自动旋转180度校正安装方向）
                 ids_image_np = ids_process_img()
-                print(f"[第{IMAGE_COUNT}帧] IDS图像获取成功，形状: {ids_image_np.shape}")
+                #print(f"[第{IMAGE_COUNT}帧] IDS图像获取成功，形状: {ids_image_np.shape}")
                 
-                print(f"[第{IMAGE_COUNT}帧] 获取旁轴相机图像...")
+                #print(f"[第{IMAGE_COUNT}帧] 获取旁轴相机图像...")
                 # 旁轴相机图像
                 computer_image_np = get_computer_camera_frame()
                 
@@ -1364,7 +1493,7 @@ def capture_images(capture_interval, image_queue):
                     computer_img = cv2.cvtColor(computer_image_np, cv2.COLOR_BGR2RGB)
                     computer_pil_img = Image.fromarray(computer_img)
                     computer_pil_img.save(computer_image_path)
-                    print(f"[第{IMAGE_COUNT}帧] 旁轴相机图像已保存: {computer_image_path}")
+                    #print(f"[第{IMAGE_COUNT}帧] 旁轴相机图像已保存: {computer_image_path}")
                 else:
                     computer_image_path = ""
                 
@@ -1386,7 +1515,7 @@ def capture_images(capture_interval, image_queue):
                         # 获取红外原始数据
                         thermal_data = fotric_device.get_thermal_data()
                         if thermal_data is not None:
-                            print(f"[第{IMAGE_COUNT}帧] 开始保存红外相机数据...")
+                            #print(f"[第{IMAGE_COUNT}帧] 开始保存红外相机数据...")
                             
                             # 保存原始热像数据为 NPZ 格式（高效压缩存储）
                             fotric_data_path = os.path.join(fotric_data_dir, f"thermal_data-{IMAGE_COUNT}.npz")
@@ -1398,17 +1527,36 @@ def capture_images(capture_interval, image_queue):
                                 temp_max=float(np.max(thermal_data)),
                                 temp_avg=float(np.mean(thermal_data))
                             )
-                            print(f"[第{IMAGE_COUNT}帧] 红外数据已保存: {fotric_data_path}")
+                            #print(f"[第{IMAGE_COUNT}帧] 红外数据已保存: {fotric_data_path}")
                             
                             # 保存彩色热像图 (JPG 格式用于直观查看)
                             try:
-                                if fotric_temp_max_cached > fotric_temp_min_cached:
-                                    normalized = ((thermal_data - fotric_temp_min_cached) / (fotric_temp_max_cached - fotric_temp_min_cached) * 255).astype(np.uint8)
-                                else:
-                                    # 当没有温度范围时，用中灰色替代全黑
-                                    normalized = np.full_like(thermal_data, 128, dtype=np.uint8)
+                                # 使用界面设置的温度范围和调色板
+                                try:
+                                    display_temp_low = float(fotric_temp_min_entry.get())
+                                    display_temp_high = float(fotric_temp_max_entry.get())
+                                    colormap_type = fotric_colormap_var.get()
+                                except (NameError, ValueError):
+                                    # 界面控件未初始化，使用默认值
+                                    display_temp_low = 26.0
+                                    display_temp_high = 50.0
+                                    colormap_type = 'INFERNO'
                                 
-                                colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+                                # 使用固定温度范围进行归一化（不是动态的 min/max）
+                                clipped_temp = np.clip(thermal_data, display_temp_low, display_temp_high)
+                                normalized = ((clipped_temp - display_temp_low) / (display_temp_high - display_temp_low) * 255).astype(np.uint8)
+                                
+                                # 应用选择的调色板
+                                if colormap_type == 'IRON':
+                                    colored = apply_iron_colormap(normalized)
+                                elif colormap_type == 'JET':
+                                    colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+                                elif colormap_type == 'HOT':
+                                    colored = cv2.applyColorMap(normalized, cv2.COLORMAP_HOT)
+                                elif colormap_type == 'INFERNO':
+                                    colored = cv2.applyColorMap(normalized, cv2.COLORMAP_INFERNO)
+                                else:
+                                    colored = apply_iron_colormap(normalized)
                                 
                                 # 验证图像数据
                                 if colored is None or colored.size == 0:
@@ -1439,7 +1587,7 @@ def capture_images(capture_interval, image_queue):
                                             pil_image.save(fotric_image_path, quality=95)
                                             if os.path.exists(fotric_image_path):
                                                 file_size = os.path.getsize(fotric_image_path)
-                                                print(f"[第{IMAGE_COUNT}帧] 红外图像已保存: {fotric_image_path} ({file_size}字节)")
+                                                #print(f"[第{IMAGE_COUNT}帧] 红外图像已保存: {fotric_image_path} ({file_size}字节)")
                                                 save_success = True
                                         except Exception as pil_err:
                                             print(f"[第{IMAGE_COUNT}帧] PIL保存失败, 尝试cv2: {pil_err}")
@@ -1449,7 +1597,7 @@ def capture_images(capture_interval, image_queue):
                                             result = cv2.imwrite(fotric_image_path, colored)
                                             if result and os.path.exists(fotric_image_path):
                                                 file_size = os.path.getsize(fotric_image_path)
-                                                print(f"[第{IMAGE_COUNT}帧] 红外图像已保存(cv2): {fotric_image_path} ({file_size}字节)")
+                                                #print(f"[第{IMAGE_COUNT}帧] 红外图像已保存(cv2): {fotric_image_path} ({file_size}字节)")
                                                 save_success = True
                                             else:
                                                 print(f"[第{IMAGE_COUNT}帧] cv2.imwrite失败")
@@ -1460,7 +1608,7 @@ def capture_images(capture_interval, image_queue):
                                             result2 = cv2.imwrite(png_path, colored, [cv2.IMWRITE_PNG_COMPRESSION, 9])
                                             if result2 and os.path.exists(png_path):
                                                 file_size = os.path.getsize(png_path)
-                                                print(f"[第{IMAGE_COUNT}帧] 红外图像已保存(PNG): {png_path} ({file_size}字节)")
+                                                #print(f"[第{IMAGE_COUNT}帧] 红外图像已保存(PNG): {png_path} ({file_size}字节)")
                                                 fotric_image_path = png_path
                                                 save_success = True
                                         
@@ -1487,15 +1635,15 @@ def capture_images(capture_interval, image_queue):
                 image_queue.put(f"image-{IMAGE_COUNT}.jpg")
 
                 #获取打印信息
-                print(f"[第{IMAGE_COUNT}帧] 获取打印参数分类...")
-                print(f"[第{IMAGE_COUNT}帧] 调用get_print_param_class_origin()...")
+                #print(f"[第{IMAGE_COUNT}帧] 获取打印参数分类...")
+                #print(f"[第{IMAGE_COUNT}帧] 调用get_print_param_class_origin()...")
                 flow_rate_class,feed_rate_class,z_offset_class,hotend_class,bed,hot_end = get_print_param_class_origin()
-                print(f"[第{IMAGE_COUNT}帧] 打印参数获取成功")
+                #print(f"[第{IMAGE_COUNT}帧] 打印参数获取成功")
                 #flow_rate_class,feed_rate_class,z_offset_class,hotend_class,bed,hot_end = get_print_param_class_by_model(ids_image_path,model)
                 
                 # 构建 CSV 数据行，包含旁轴相机、XYZ坐标和红外相机信息
-                print(f"[第{IMAGE_COUNT}帧] 构建CSV行数据...")
-                print(f"[第{IMAGE_COUNT}帧] 当前坐标: X={current_x:.2f}, Y={current_y:.2f}, Z={current_z:.2f}")
+                #print(f"[第{IMAGE_COUNT}帧] 构建CSV行数据...")
+                #print(f"[第{IMAGE_COUNT}帧] 当前坐标: X={current_x:.2f}, Y={current_y:.2f}, Z={current_z:.2f}")
                 row_data = [ids_image_path,computer_image_path,current_time,img_timestamp,coord_timestamp,time_diff_ms,
                             current_x,current_y,current_z,
                             FLOW_RATE,FEED_RATE,Z_OFF,TARGET_HOTEND,hot_end,bed,IMAGE_COUNT,
@@ -1504,11 +1652,11 @@ def capture_images(capture_interval, image_queue):
                             fotric_image_path,fotric_data_path]
                 
                 # 调试输出：显示坐标和相机路径
-                if IMAGE_COUNT % 10 == 0:
+                if IMAGE_COUNT % 40 == 0:
                     print(f"[第{IMAGE_COUNT}帧] 坐标: X={current_x:.2f}, Y={current_y:.2f}, Z={current_z:.2f}")
                     print(f"[第{IMAGE_COUNT}帧] 旁轴相机: {computer_image_path}")
                     print(f"[第{IMAGE_COUNT}帧] 红外相机: {fotric_image_path}")
-                if(IMAGE_COUNT %10 ==0):
+                if(IMAGE_COUNT %40 ==0):
                     FLOW_RATE_label.config(text=f"{flow_rate_class}")
                     FEED_RATE_label.config(text=f"{feed_rate_class}")
                     Z_OFF_label.config(text=f"{z_offset_class}")
@@ -1538,13 +1686,13 @@ def capture_images(capture_interval, image_queue):
                             change_param_auto(FLOW_RATE,FEED_RATE,Z_OFF,TARGET_HOTEND)
                         
                 #打开csv文件
-                print(f"[第{IMAGE_COUNT}帧] 写入CSV...")
+                #print(f"[第{IMAGE_COUNT}帧] 写入CSV...")
                 with open(CSV_FILE, 'a', newline='') as csvfile:
                     writer = csv.writer(csvfile)
                     writer.writerow(row_data)
 
                 IMAGE_COUNT += 1
-                print(f"[✓] 第{IMAGE_COUNT-1}帧保存成功，下一帧编号: {IMAGE_COUNT}")
+                #print(f"[✓] 第{IMAGE_COUNT-1}帧保存成功，下一帧编号: {IMAGE_COUNT}")
                 time.sleep(capture_interval)
             except Exception as e:
                 import traceback
@@ -1969,17 +2117,33 @@ def test_save_single_frame():
                     )
                     print(f"[测试保存] ✓ 红外数据已保存: {fotric_data_path}")
                     
-                    # 保存彩色热像图
-                    if fotric_temp_max_cached > fotric_temp_min_cached:
-                        normalized = ((thermal_data - fotric_temp_min_cached) / 
-                                     (fotric_temp_max_cached - fotric_temp_min_cached) * 255).astype(np.uint8)
-                    else:
-                        normalized = np.full_like(thermal_data, 128, dtype=np.uint8)
+                    # 保存彩色热像图（使用界面设置）
+                    try:
+                        test_temp_low = float(fotric_temp_min_entry.get())
+                        test_temp_high = float(fotric_temp_max_entry.get())
+                        test_colormap = fotric_colormap_var.get()
+                    except (NameError, ValueError):
+                        test_temp_low = 26.0
+                        test_temp_high = 50.0
+                        test_colormap = 'INFERNO'
                     
-                    colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+                    clipped_temp = np.clip(thermal_data, test_temp_low, test_temp_high)
+                    normalized = ((clipped_temp - test_temp_low) / (test_temp_high - test_temp_low) * 255).astype(np.uint8)
+                    
+                    if test_colormap == 'IRON':
+                        colored = apply_iron_colormap(normalized)
+                    elif test_colormap == 'JET':
+                        colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+                    elif test_colormap == 'HOT':
+                        colored = cv2.applyColorMap(normalized, cv2.COLORMAP_HOT)
+                    elif test_colormap == 'INFERNO':
+                        colored = cv2.applyColorMap(normalized, cv2.COLORMAP_INFERNO)
+                    else:
+                        colored = apply_iron_colormap(normalized)
+                    
                     fotric_image_path = os.path.join(fotric_image_dir, "test_image_Fotric.jpg")
                     cv2.imwrite(fotric_image_path, colored)
-                    print(f"[测试保存] ✓ 红外图像已保存: {fotric_image_path}")
+                    print(f"[测试保存] ✓ 红外图像已保存: {fotric_image_path} (范围: {test_temp_low}~{test_temp_high}°C, 调色板: {test_colormap})")
                 else:
                     print("[测试保存] ⚠ 红外数据获取失败")
             except Exception as e:
@@ -2257,44 +2421,132 @@ def update_param_loop_state():
 #菜单界面的修改参数按钮逻辑   
 def change_param_by_button():
     global FLOW_RATE,FEED_RATE,Z_OFF,TARGET_HOTEND,PRIMARY_Z_OFF,CUR_Z_OFF
-    FLOW_RATE = int(FLOW_RATE_entry.get())
-    FEED_RATE = int(FEED_RATE_entry.get())
-    Z_OFF = float(Z_OFF_entry.get())
-    send_z_off = Z_OFF-CUR_Z_OFF
+    
+    # 获取界面输入值
+    new_flow_rate = int(FLOW_RATE_entry.get())
+    new_feed_rate = int(FEED_RATE_entry.get())
+    new_z_off = float(Z_OFF_entry.get())
+    new_target_hotend = int(TARGET_HOTEND_entry.get())
+    
+    # 更新全局变量
+    FLOW_RATE = new_flow_rate
+    FEED_RATE = new_feed_rate
+    Z_OFF = new_z_off
+    TARGET_HOTEND = new_target_hotend
+    
+    # 计算Z偏移增量
+    send_z_off = Z_OFF - CUR_Z_OFF
     CUR_Z_OFF = Z_OFF
-    TARGET_HOTEND = int(TARGET_HOTEND_entry.get())
+    
+    # 更新界面显示（确保一致）
+    flow_rate.set(FLOW_RATE)
+    feed_rate.set(FEED_RATE)
+    z_off.set(Z_OFF)
+    target_hotend.set(TARGET_HOTEND)
+    
     print(f"[手动修改] 热端={TARGET_HOTEND}, 流量={FLOW_RATE}, 速率={FEED_RATE}, Z补偿={Z_OFF}")
     
-    # 使用异步发送，不阻塞UI
-    send_gcode_async(f"M104 S{TARGET_HOTEND}")
-    send_gcode_async(f"M290 Z{send_z_off}")
-    send_gcode_async(f"M221 S{FLOW_RATE}")
-    send_gcode_async(f"M220 S{FEED_RATE}")
+    # 使用批量发送，避免与M114冲突
+    send_gcode_batch([
+        f"M104 S{TARGET_HOTEND}",
+        f"M290 Z{send_z_off}",
+        f"M221 S{FLOW_RATE}",
+        f"M220 S{FEED_RATE}"
+    ], delay=0.3)
 
-def change_param_auto(FLOW_RATE,FEED_RATE,Z_OFF,TARGET_HOTEND,init=None):
-    TARGET_HOTEND = int(TARGET_HOTEND)
-    global PRIMARY_Z_OFF,CUR_Z_OFF
+def change_param_auto(flow_rate_val, feed_rate_val, z_off_val, target_hotend_val, init=None):
+    """
+    自动修改参数
+    
+    Args:
+        flow_rate_val: 流量值
+        feed_rate_val: 速度值  
+        z_off_val: Z偏移值
+        target_hotend_val: 热端温度值
+        init: 是否初始化Z轴补偿
+    """
+    global PRIMARY_Z_OFF, CUR_Z_OFF, FLOW_RATE, FEED_RATE, Z_OFF, TARGET_HOTEND
+    
+    # 更新全局变量
+    FLOW_RATE = int(flow_rate_val)
+    FEED_RATE = int(feed_rate_val)
+    Z_OFF = float(z_off_val)
+    TARGET_HOTEND = int(target_hotend_val)
+    
     if init:
-        send_gcode(f"M851 Z{PRIMARY_Z_OFF}")
+        send_gcode(f"M851 Z{PRIMARY_Z_OFF}", timeout=5)
         print(f"初始化Z轴补偿{PRIMARY_Z_OFF}")
     
-    send_z_off = Z_OFF-CUR_Z_OFF
+    send_z_off = Z_OFF - CUR_Z_OFF
     CUR_Z_OFF = Z_OFF
+    
+    # 更新界面显示
     flow_rate.set(FLOW_RATE)
     feed_rate.set(FEED_RATE)
     z_off.set(Z_OFF)
     target_hotend.set(TARGET_HOTEND)
     
     # 使用异步方式发送所有G代码，避免阻塞主线程
-    print(f"[参数修改] 发送命令: M104 S{TARGET_HOTEND}, M290 Z{send_z_off}, M221 S{FLOW_RATE}, M220 S{FEED_RATE}")
-    send_gcode_async(f"M104 S{TARGET_HOTEND}")  # 设置热端温度
-    send_gcode_async(f"M290 Z{send_z_off}")     # 调整Z轴
-    send_gcode_async(f"M221 S{FLOW_RATE}")      # 设置流量
-    send_gcode_async(f"M220 S{FEED_RATE}")      # 设置速度
+    print(f"[参数修改] 准备发送命令: M104 S{TARGET_HOTEND}, M290 Z{send_z_off}, M221 S{FLOW_RATE}, M220 S{FEED_RATE}")
+    print(f"[参数修改] 当前全局变量: FLOW_RATE={FLOW_RATE}, FEED_RATE={FEED_RATE}")
     
-    # 异步发送M114获取坐标，不阻塞
-    if ws and is_websocket_connected:
-        ws.send(json.dumps(["sendCommand", f"M114"]))
+    # 使用局部变量捕获当前值，避免线程执行时变量被修改
+    _target_hotend = TARGET_HOTEND
+    _send_z_off = send_z_off
+    _flow_rate = FLOW_RATE
+    _feed_rate = FEED_RATE
+    
+    # 使用单个线程顺序发送所有命令，避免串口冲突
+    def _send_all_commands():
+        global m114_last_update_time
+        
+        # 获取M114锁，暂停M114更新，避免命令冲突
+        if m114_update_lock.acquire(blocking=True, timeout=3):
+            try:
+                # 标记最近更新时间，防止M114立即执行（暂停M114 8秒）
+                m114_last_update_time = time.time() + 5  # +5秒表示额外暂停5秒
+                
+                print(f"[参数修改-线程] 实际发送: M104 S{_target_hotend}, M290 Z{_send_z_off}, M221 S{_flow_rate}, M220 S{_feed_rate}")
+                
+                # 发送温度命令
+                success1 = send_gcode(f"M104 S{_target_hotend}", timeout=5)
+                if not success1:
+                    print(f"[参数修改警告] 热端温度设置可能失败")
+                time.sleep(0.3)  # 增加延迟，避免命令冲突
+                
+                # 发送Z轴调整
+                success2 = send_gcode(f"M290 Z{_send_z_off}", timeout=5)
+                if not success2:
+                    print(f"[参数修改警告] Z轴调整可能失败")
+                time.sleep(0.3)
+                
+                # 发送流量设置
+                success3 = send_gcode(f"M221 S{_flow_rate}", timeout=5)
+                if not success3:
+                    print(f"[参数修改警告] 流量设置可能失败")
+                time.sleep(0.3)
+                
+                # 发送速度设置
+                success4 = send_gcode(f"M220 S{_feed_rate}", timeout=5)
+                if not success4:
+                    print(f"[参数修改警告] 速度设置可能失败")
+                
+                # 更新最后M114时间，给打印机更多处理时间（总共暂停8秒）
+                m114_last_update_time = time.time() + 3
+                
+                if success1 and success2 and success3 and success4:
+                    print(f"[参数修改] 所有命令已成功发送，M114暂停8秒")
+                else:
+                    print(f"[参数修改警告] 部分命令可能未成功，请检查OctoPrint终端")
+                    
+            finally:
+                m114_update_lock.release()
+        else:
+            print(f"[参数修改警告] 无法获取M114锁，命令可能与其他操作冲突")
+    
+    # 启动单个线程发送所有命令
+    thread = threading.Thread(target=_send_all_commands, daemon=True)
+    thread.start()
 
 FLOW_RATE_LIST = deque(maxlen=10)
 FEED_RATE_LIST = deque(maxlen=10)
@@ -2404,11 +2656,11 @@ try:
         )
         fotric_enabled = fotric_device.is_connected
         if fotric_enabled:
-            print(f"✓ 红外相机初始化成功: {fotric_device.width}x{fotric_device.height} ({fotric_config['ip']}:{fotric_config['port']})")
+            print(f"[OK] 红外相机初始化成功: {fotric_device.width}x{fotric_device.height} ({fotric_config['ip']}:{fotric_config['port']})")
         else:
-            print("✗ 红外相机连接失败")
+            print("[FAIL] 红外相机连接失败")
 except Exception as e:
-    print(f"✗ 红外相机初始化异常: {e}")
+    print(f"[ERROR] 红外相机初始化异常: {e}")
     fotric_enabled = False
     fotric_device = None
 
@@ -2724,6 +2976,59 @@ fotric_temp_frame.pack(pady=2, fill='x')
 tk.Label(fotric_temp_frame, text="温度统计", bg='#e8e8e8', font=('Arial', 10, 'bold')).pack(side='left', padx=5)
 fotric_temp_info = tk.Label(fotric_temp_frame, text="最小: -- | 平均: -- | 最大: --", bg='#e8e8e8', font=('Arial', 9), fg='#FF5722')
 fotric_temp_info.pack(side='left', padx=10)
+
+# 红外显示控制面板（温度范围和调色板）
+fotric_control_frame = tk.Frame(fotric_label_panel, bg='#f0f0f0')
+fotric_control_frame.pack(pady=3, fill='x')
+
+# 温度范围控制
+tk.Label(fotric_control_frame, text="显示范围:", bg='#f0f0f0', font=('Arial', 9, 'bold')).grid(row=0, column=0, padx=3, pady=2)
+tk.Label(fotric_control_frame, text="Min:", bg='#f0f0f0', font=('Arial', 8)).grid(row=0, column=1, padx=2)
+fotric_temp_min_entry = tk.Entry(fotric_control_frame, font=('Arial', 8), width=5, relief='sunken', bd=1)
+fotric_temp_min_entry.grid(row=0, column=2, padx=2)
+fotric_temp_min_entry.insert(0, "26")
+tk.Label(fotric_control_frame, text="°C", bg='#f0f0f0', font=('Arial', 8)).grid(row=0, column=3, padx=1)
+
+tk.Label(fotric_control_frame, text="Max:", bg='#f0f0f0', font=('Arial', 8)).grid(row=0, column=4, padx=2)
+fotric_temp_max_entry = tk.Entry(fotric_control_frame, font=('Arial', 8), width=5, relief='sunken', bd=1)
+fotric_temp_max_entry.grid(row=0, column=5, padx=2)
+fotric_temp_max_entry.insert(0, "50")
+tk.Label(fotric_control_frame, text="°C", bg='#f0f0f0', font=('Arial', 8)).grid(row=0, column=6, padx=1)
+
+# 调色板选择
+tk.Label(fotric_control_frame, text="调色板:", bg='#f0f0f0', font=('Arial', 9, 'bold')).grid(row=0, column=7, padx=(10, 2))
+fotric_colormap_var = tk.StringVar(value="INFERNO")
+fotric_colormap_combo = ttk.Combobox(fotric_control_frame, textvariable=fotric_colormap_var, 
+                                      values=["IRON", "JET", "HOT", "INFERNO"], 
+                                      width=8, font=('Arial', 8), state='readonly')
+fotric_colormap_combo.grid(row=0, column=8, padx=2)
+
+# 应用按钮
+def apply_fotric_display_settings():
+    """应用红外显示设置"""
+    global THERMAL_VISUALIZATION
+    try:
+        temp_min = float(fotric_temp_min_entry.get())
+        temp_max = float(fotric_temp_max_entry.get())
+        colormap = fotric_colormap_var.get()
+        
+        if temp_min >= temp_max:
+            print("[红外设置错误] 最小温度必须小于最大温度")
+            return
+        
+        # 更新配置
+        THERMAL_VISUALIZATION['temp_low'] = temp_min
+        THERMAL_VISUALIZATION['temp_high'] = temp_max
+        THERMAL_VISUALIZATION['colormap'] = colormap
+        
+        print(f"[红外显示设置] 范围: {temp_min}°C ~ {temp_max}°C, 调色板: {colormap}")
+    except ValueError:
+        print("[红外设置错误] 请输入有效的数字")
+
+fotric_apply_btn = tk.Button(fotric_control_frame, text="应用", font=('Arial', 8), 
+                              bg='#4CAF50', fg='white', relief='raised', bd=2,
+                              command=apply_fotric_display_settings)
+fotric_apply_btn.grid(row=0, column=9, padx=5)
 
 #---记录控制变量
 is_recording = False
@@ -3088,11 +3393,11 @@ if __name__ == "__main__":
     root.protocol("WM_DELETE_WINDOW", on_closing)
     start_websocket()
     
-    # 启动M114坐标获取定时器 (每500毫秒执行一次，与图像采集同频)
+    # 启动Z高度获取定时器 (每5000毫秒执行一次，从DisplayZ插件获取)
     def schedule_m114_update():
-        """定时更新M114坐标"""
-        update_m114_coordinates()
-        root.after(500, schedule_m114_update)  # 0.5秒一次，与2Hz图像采集同步
+        """定时更新Z高度（从DisplayZ插件获取，不干扰打印）"""
+        update_z_height_from_displayz()
+        root.after(5000, schedule_m114_update)  # 5秒一次
     
     # 启动打印机状态显示更新定时器 (每2000毫秒执行一次)
     def schedule_printer_status_update():
@@ -3139,7 +3444,7 @@ if __name__ == "__main__":
     # =============================================
     
     # 启动定时器
-    root.after(500, schedule_m114_update)
+    root.after(1000, schedule_m114_update)
     root.after(1000, schedule_printer_status_update)
     
     update_frame()

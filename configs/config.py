@@ -37,3 +37,12 @@ OCTOPRINT = {
     'username':'chenrs',
     'password':'cjn4085322'
 }
+
+# 热像仪温度映射配置（固定范围，铁红伪彩色）
+# 用于可视化打印第一层温度分布
+# 参考：铁红调色板 - 低温(黑/深蓝) -> 中温(紫/红) -> 高温(黄/白)
+THERMAL_VISUALIZATION = {
+    'temp_low': 26.0,      # 固定温度下限 (°C) -> 映射到调色板起点(黑/深蓝)
+    'temp_high': 50.0,     # 固定温度上限 (°C) -> 映射到调色板终点(黄/白)
+    'colormap': 'INFERNO',    # 默认调色板: 'INFERNO', 'IRON', 'JET', 'HOT'
+}

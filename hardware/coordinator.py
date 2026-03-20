@@ -18,9 +18,10 @@ import requests
 import json
 from threading import Thread, Lock
 from datetime import datetime
+from configs.collector_config import OCTOPRINT_CONFIG
 
-OCTOPRINT_URL = "http://127.0.0.1:5000"
-API_KEY = "UGjrS2T5n_48GF0YsWADx1EoTILjwn7ZkeWUfgGvW2Q"
+OCTOPRINT_URL = OCTOPRINT_CONFIG['url']
+API_KEY = OCTOPRINT_CONFIG['api_key']
 
 class M114Coordinator:
     """通过serial.log获取打印机坐标"""
