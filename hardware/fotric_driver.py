@@ -61,6 +61,64 @@ class FotricEnhancedDevice:
     URL_SENSOR_LUT = "/sensor/lut"
     URL_SENSOR_LUT_TABLE = "/sensor/luts/{}?list"
     
+    # 铁红调色板查找表 (LUT) - 256级
+    # 颜色渐变：黑(0,0,0) -> 深蓝 -> 紫 -> 红 -> 橙 -> 黄 -> 白(255,255,255)
+    _IRON_LUT = None
+    
+    @classmethod
+    def _get_iron_colormap_lut(cls):
+        """获取铁红调色板查找表（延迟初始化）"""
+        if cls._IRON_LUT is not None:
+            return cls._IRON_LUT
+        
+        # 创建铁红调色板 - 256级
+        lut = np.zeros((256, 3), dtype=np.uint8)
+        
+        for i in range(256):
+            t = i / 255.0  # 归一化到 [0, 1]
+            
+            # 铁红调色板的颜色映射
+            if t < 0.125:  # 0-31: 黑色到深蓝
+                r = 0
+                g = 0
+                b = int(t / 0.125 * 128) + 16
+            elif t < 0.375:  # 32-95: 深蓝到紫色
+                r = int((t - 0.125) / 0.25 * 128)
+                g = 0
+                b = 255
+            elif t < 0.625:  # 96-159: 紫色到红色
+                r = 128 + int((t - 0.375) / 0.25 * 127)
+                g = 0
+                b = 255 - int((t - 0.375) / 0.25 * 128)
+            elif t < 0.875:  # 160-223: 红色到黄色
+                r = 255
+                g = int((t - 0.625) / 0.25 * 255)
+                b = 0
+            else:  # 224-255: 黄色到白色
+                r = 255
+                g = 255
+                b = int((t - 0.875) / 0.125 * 255)
+            
+            lut[i] = [b, g, r]  # OpenCV 使用 BGR 格式
+        
+        cls._IRON_LUT = lut
+        return cls._IRON_LUT
+    
+    @classmethod
+    def _apply_iron_colormap(cls, gray_image):
+        """
+        应用铁红调色板到灰度图像
+        
+        Args:
+            gray_image: 灰度图像 (0-255)
+        
+        Returns:
+            BGR彩色图像
+        """
+        lut = cls._get_iron_colormap_lut()
+        colored = lut[gray_image]
+        return colored
+    
     def __init__(self, ip: str = "192.168.1.100", 
                  port: int = 10080,  # 使用正确的默认端口
                  username: str = "admin", 
@@ -681,8 +739,15 @@ class FotricEnhancedDevice:
         """检查设备状态 - SLS项目接口"""
         return self.is_connected and self.is_running
     
-    def save_current_frame(self, filepath):
-        """保存当前帧 - 兼容IR8062接口"""
+    def save_current_frame(self, filepath, temp_range=None, colormap=None):
+        """
+        保存当前帧 - 兼容IR8062接口
+        
+        Args:
+            filepath: 保存路径
+            temp_range: 可选，温度范围 (temp_low, temp_high)，如 (26.0, 50.0)
+            colormap: 可选，调色板类型 ('IRON', 'JET', 'HOT', 'INFERNO')
+        """
         if not self.latest_frame:
             return False
             
@@ -744,13 +809,44 @@ class FotricEnhancedDevice:
         # 保存可视化图像到CH3文件夹（原filepath）
         try:
             import cv2
+            
+            # 使用传入的参数或从配置文件读取默认值
+            from configs.config import THERMAL_VISUALIZATION
+            tv = THERMAL_VISUALIZATION
+            
+            # 温度范围：优先使用传入的参数，否则使用配置默认值
+            if temp_range is not None:
+                temp_low, temp_high = temp_range
+            else:
+                temp_low = tv.get('temp_low', 26.0)
+                temp_high = tv.get('temp_high', 50.0)
+            
+            # 调色板：优先使用传入的参数，否则使用配置默认值
+            if colormap is not None:
+                colormap_type = colormap
+            else:
+                colormap_type = tv.get('colormap', 'IRON')
+            
             temp_min, temp_max = frame.min(), frame.max()
+            
             if temp_max > temp_min:
-                normalized = ((frame - temp_min) / (temp_max - temp_min) * 255).astype(np.uint8)
+                # 将温度裁剪到显示范围并归一化到 [0, 255]
+                clipped_temp = np.clip(frame, temp_low, temp_high)
+                normalized = ((clipped_temp - temp_low) / (temp_high - temp_low) * 255).astype(np.uint8)
             else:
                 normalized = np.zeros_like(frame, dtype=np.uint8)
             
-            colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+            # 应用铁红调色板或OpenCV调色板
+            if colormap_type == 'IRON':
+                colored = self._apply_iron_colormap(normalized)
+            elif colormap_type == 'JET':
+                colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+            elif colormap_type == 'HOT':
+                colored = cv2.applyColorMap(normalized, cv2.COLORMAP_HOT)
+            elif colormap_type == 'INFERNO':
+                colored = cv2.applyColorMap(normalized, cv2.COLORMAP_INFERNO)
+            else:
+                colored = self._apply_iron_colormap(normalized)
             # 使用Fotric设备的原生分辨率 (640x480)，而不是IR8062的8倍放大
             if colored.shape[:2] != (self.height, self.width):
                 resized = cv2.resize(colored, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
